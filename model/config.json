@@ -1,0 +1,8 @@
+{
+  "vocab_size":98745,
+  "embedding_size":128,
+  "hidden_siez":128,
+  "dropout":0.2,
+  "q_len":50,
+  "p_len":350
+}
