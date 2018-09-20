@@ -4,5 +4,8 @@
   "hidden_siez":128,
   "dropout":0.2,
   "q_len":50,
-  "p_len":350
+  "p_len":350,
+  "alt_len":20,
+  "batch":20,
+  "hidden_size":128
 }

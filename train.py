@@ -17,5 +17,5 @@ dev_data = sorted(dev_data, key=lambda x: len(x[1]))
 print('train data size {:d}, dev data size {:d}, testa data size {:d}'.format(len(train_data), len(dev_data),len(test_data)))
 
 model=MwAN()
-model.build() 
+model.build()
 
