@@ -14,15 +14,18 @@ class MwAN:
         cell = tf.nn.rnn_cell.DropoutWrapper(cell, input_keep_prob=in_keep_prob)
         return cell
 
-    def mat_weigth_mul(self, mat, weight):
+    def mat_weight_mul(self, mat, weight):
         """ 带batch的矩阵相乘"""
-        # mat*weight => [batch_size,n,m] * [m,p]=[batch_size,p]
+        # mat(b,n,m) *weight(m,p)
+        # => (b,n,m) -> (b*n,m)
+        # => (b*n,m)*(m,p)=(b*n,p)
+        # return (b,n,p)
         mat_shape = mat.get_shape().as_list()
         weight_shape = weight.get_shape().as_list()
         assert (mat_shape[-1] == weight_shape[0])  # 检查矩阵是否可以相乘
-        mat_reshape = tf.reshape(mat, shape=[-1, mat_shape[-1]])  # [batch_size*n,m]
-        mul = tf.matmul(mat_reshape, weight)  # [batch_size*n,p]
-        return tf.reshape(mul, shape=[-1, mat_shape[1], weight_shape[-1]])  # [batch_size,n,p]
+        mat_reshape = tf.reshape(mat, shape=[-1, mat_shape[-1]])  # [b*n,m]
+        mul = tf.matmul(mat_reshape, weight)  # [b*n,p]
+        return tf.reshape(mul, shape=[-1, mat_shape[1], weight_shape[-1]])  # [b,n,p]
 
     def random_bias(self, dim, name=None):
         return tf.Variable(tf.truncated_normal(shape=[dim]), name=name)
@@ -35,13 +38,21 @@ class MwAN:
         # multi way attention weigth
         # concatenate
         self.W_c_p = self.random_weight(dim_in=2 * opts["hidden_size"], dim_out=opts["hidden_size"],
-                                        name="concat_attention_weight_p")
+                                        name="concat_att_w_p")
         self.W_c_q = self.random_weight(dim_in=2 * opts["hidden_size"], dim_out=opts["hidden_size"],
-                                        name="concat_attention_weight_q")
-        self.V_c = self.random_bias(dim=opts["hidden_size"], name="concat_attention_v")
+                                        name="concat_att_w_q")
+        self.V_c = self.random_bias(dim=opts["hidden_size"], name="concat_att_v")
         # bilinear
-        self.W_b = self.random_weight(dim_in=2*opts["hidden_size"],dim_out=2*opts["hidden_size"],name="bilinear_weight")
-
+        self.W_b = self.random_weight(dim_in=2*opts["hidden_size"],dim_out=2*opts["hidden_size"],name="bilinear_att_w")
+        # dot
+        self.W_d=self.random_weight(dim_in=2*opts["hidden_size"],dim_out=opts["hidden_size"],name="dot_att_w")
+        self.V_d=self.random_bias(dim=opts["hidden_size"],name="dot_att_v")
+        # minus
+        self.W_m=self.random_weight(dim_in=2*opts["hidden_size"],dim_out=opts["hidden_size"],name="minus_att_w")
+        self.V_m=self.random_bias(dim=opts["hidden_size"],name="minus_att_v")
+        # self att
+        self.W_s=self.random_weight(dim_in=2*opts["hidden_size"],dim_out=opts["hidden_size"],name="self_att_w")
+        self.V_s = self.random_bias(dim=opts["hidden_size"], name="minus_att_s")
 
 
     def build(self):
@@ -85,45 +96,122 @@ class MwAN:
 
         with tf.variable_scope("Multiway_Matching_Layer"):
             print("Layer2: Multi-way Matching Layer")
+
             # Concat Attention
-            print("obtaining concat attention")
-            q_k_c=[]
-            for t in range(opts["p_len"]):
-                h_p_t=h_p[:,t,:]
-                h_p_t_tiled=tf.concat([tf.reshape(h_p_t,shape=[opts["batch"],1,-1])]*opts["q_len"],axis=1)
-                w_c_p=self.mat_weigth_mul(h_p_t_tiled, self.W_c_p) # (b,p,2h) * (2h,h) => (b,p,h)
-                w_c_q=self.mat_weigth_mul(h_q, self.W_c_q) # (b,q,2h) * (2h,h) => (b,q,h)
-                s_t_c=tf.squeeze(self.mat_weigth_mul(tf.tanh(w_c_p+w_c_q),tf.reshape(self.V_c,shape=[-1,1]))) # (b,q,h)* (h,1) =squeeze=> (b,q)
-                a_c=tf.nn.softmax(s_t_c,axis=1)
-                # print("attention c:",a_c)
-                a_c=tf.concat([tf.reshape(a_c,shape=[opts["batch"],-1,1])]*2*opts["hidden_size"],axis=2)
-                h_q_att = tf.reduce_sum(tf.multiply(h_q, a_c), axis=1)
-                q_k_c.append(h_q_att)
-            q_k_c=tf.stack(values=q_k_c,axis=1)
-            print("concat qk:",q_k_c)
+            print("obtaining concat attention...")
+            """adapted from pytorch
+           _s1 = self.Wc1(hq).unsqueeze(1) # (b,q,2h) * (2h,h) = (b,p,h) =us1= (b,1,q,h)
+           _s2 = self.Wc2(hp).unsqueeze(2) # (b,p,2h) * (2h,h) = (b,p,h) =us2= (b,p,1,h)
+           sjt = self.vc(torch.tanh(_s1 + _s2)).squeeze() # 自动广播(2,3维度) (b,p,q,h) * (h,1) = (b,p,q)
+           ait = F.softmax(sjt, 2) # (b,p,q)
+           qtc = ait.bmm(hq) # (b,p,q) b* (b,q,2h) = (b,p,2h)
+           """
+            _s1=self.mat_weight_mul(h_q, self.W_c_q)
+            _s1=tf.expand_dims(_s1,axis=1) # (b,1,q,h)
+            _s2=self.mat_weight_mul(h_p, self.W_c_p)
+            _s2=tf.expand_dims(_s2,axis=2) # (b,p,1,h)
+            tanh=tf.tanh(_s1+_s2) # (b,p,q,h) 在维度为1的位置上自动广播 相当于til操作
 
+            # sjt=tf.squeeze(tf.matmul(tanh,tf.reshape(self.V_c,shape=[-1,1]))) # (b,p,q,h) * (h,1) =sq=> (b,p,q) TODO: tf 中(b,p,q,h) * (h,1) 不可直接matmul
+            sjt=tf.matmul(tf.reshape(tanh,[-1,opts["hidden_size"]]),tf.reshape(self.V_c,[-1,1]))# (b*p*q,h) * (h,1) => (b*p*q,1)
+            sjt=tf.squeeze(tf.reshape(sjt,shape=[opts["batch"],opts["p_len"],opts["q_len"],-1])) # (b,p,q,1) =sq=> (b,p,q)
+            ait=tf.nn.softmax(sjt,axis=2) # (b,p,q)
+
+            # apply attention weight
+            qtc= tf.matmul(ait,h_q) # (b,p,q) batch* (b,q,2h) => (b,p,2h) 当识别到有batch时 tf.matmul 自动转变为keras.K.batch_dot
+
+            print("_s1: {} | _s2: {}".format(_s1, _s2))
+            print("tanh:", tanh, "自动广播")
+            print("sjt: {}".format(sjt))
+            print("qtc: {}".format(qtc))
             # Bi-linear Attention
-            print("obtaining bi-linear attention")
-            q_k_b = []
-            for t in range(opts["p_len"]):
-                h_p_t = tf.squeeze(h_p[:, t, :])  # (b,1,2h) => (b,2h)
-                h_p_t_W_b = tf.matmul(h_p_t,self.W_b)  # (b,2h)
-                # print("h_p_t_W_b:",h_p_t_W_b)
-                h_q_trans=tf.transpose(h_q,perm=[0,2,1]) # (b,q,2h) => (b,2h,q)
-                # s_t_c=tf.keras.backend.batch_dot(h_p_t_W_b,h_q_trans)
-                s_t_c=tf.matmul(tf.expand_dims(h_p_t_W_b,axis=1),h_q_trans) # the same with keras.K.batch_dot (b,1,q)
-                s_t_c=tf.squeeze(tf.transpose(s_t_c,perm=[0,2,1])) # (b,q,1) =squeeze=> (b,q)
+            print("obtaining bi-linear attention...")
+            """adapted from pytorch
+           _s1 = self.Wb(hq).transpose(2, 1) # (b,q,2h) * (2h,2h) =trans= (b,2h,q)
+           sjt = hp.bmm(_s1) # (b,p,2h) b* (b,2h,q) = (b,p,q)
+           ait = F.softmax(sjt, 2) # (b,p,q)
+           qtb = ait.bmm(hq) # (b,p,q) b* (b,q,2h) = (b,p,2h)
+           """
+            _s = self.mat_weight_mul(h_q, self.W_b) # (b,q,2h) * (2h,2h) => (b,q,2h)
+            _s = tf.transpose(_s,perm=[0,2,1]) # (b,q,2h) => (b,2h,q)
+            sjt= tf.matmul(h_p,_s) # (b,p,2h) batch* (b,2h,q) => (b,p,q)
+            ait=tf.nn.softmax(sjt,axis=2) # (b,p,q)
+            qtb=tf.matmul(ait,h_q) # (b,p,q) batch* (b,q,2h) => (b,p,2h) 顺序不能反
 
-                a_c = tf.nn.softmax(s_t_c, axis=1)
-                # print("attention c:",a_c)
-                a_c = tf.concat([tf.reshape(a_c, shape=[opts["batch"], -1, 1])] * 2 * opts["hidden_size"], axis=2)
-                h_q_att =tf.reduce_sum(tf.multiply(h_q, a_c),axis=1)
-                q_k_b.append(h_q_att)
-            q_k_b = tf.stack(values=q_k_b, axis=1)
-            print("bi-linear qk:", q_k_b)
+            print("qtb: {}".format(qtb))
 
-
-            # Bilinear Attention
             # Dot Attention
+            print("obtaining dot attention...")
+            """ adapted from pytorch
+           _s1 = hq.unsqueeze(1) # (b,q,2h) =us1= (b,1,q,2h)
+           _s2 = hp.unsqueeze(2) # (b,p,2h) =us2= (b,p,1,2h)
+           sjt = self.vd(torch.tanh(self.Wd(_s1 * _s2))).squeeze() # (b,p,q,2h)*(2h,h)*(h,) =sq= (b,p,q)
+           ait = F.softmax(sjt, 2) # (b,p,q)
+           qtd = ait.bmm(hq)  # (b,p,q) b* (b,q,2h) = (b,p,2h)
+           """
+            _s1 = tf.expand_dims(h_q,axis=1) # (b,q,2h) => (b,1,q,2h)
+            _s2 = tf.expand_dims(h_p,axis=2) # (b,p,2h) => (b,p,1,2h)
+
+            _tanh=self.mat_weight_mul(_s1 * _s2, self.W_d) # 乘法自动广播 (b,p,q,2h)*(2h,h) =mat_weight_mul=> (b,p*q,h)
+            tanh=tf.reshape(_tanh,[opts["batch"],opts["p_len"],opts["q_len"],-1]) # (b,p,q,h)
+            _sjt=self.mat_weight_mul(_tanh,tf.reshape(self.V_d,[-1,1])) # (b,p*q,1) =sq=> (b,p*q,1)
+            sjt=tf.squeeze(tf.reshape(_sjt,[opts["batch"],opts["p_len"],opts["q_len"],-1])) # (b.p,q)
+            ait=tf.nn.softmax(sjt,axis=2)
+
+            qtd = tf.matmul(ait,h_q) # (b,p,q) batch* (b,q,2h) => (b,p,2h)
+            print("_tanh from mat_weight_mul: {}".format(_tanh))
+            print("tanh reshaped: {}".format(tanh))
+            print("_sjt from mat_weight_mul: {} ".format(_sjt))
+            print("sjt reshaped: {}".format(sjt))
+            print("qtd: {}".format(qtd))
+
             # Minus Attention
+            print("obtaining minus attention...")
+            """adapted from pytorch
+           _s1 = hq.unsqueeze(1) # (b,1,q,2h)
+           _s2 = hp.unsqueeze(2) # (b,p,1,2h)
+           sjt = self.vm(torch.tanh(self.Wm(_s1 - _s2))).squeeze() # (b,p,q,2h)*(2h,h)(h,) =sq= (b,p,q)
+           ait = F.softmax(sjt, 2) # (b,p,q)
+           qtm = ait.bmm(hq) # (b,p,q) b* (b,q,2h) = (b,p,2h)
+           """
+            _s1 = tf.expand_dims(h_q, axis=1)  # (b,q,2h) => (b,1,q,2h)
+            _s2 = tf.expand_dims(h_p, axis=2)  # (b,p,2h) => (b,p,1,2h)
+
+            _tanh=self.mat_weight_mul(_s1-_s2,self.W_m) # (b,p*q,h)
+            _sjt=self.mat_weight_mul(_tanh,tf.reshape(self.V_m,[-1,1])) # (b,p*q,1)
+            sjt=tf.squeeze(tf.reshape(_sjt,[opts["batch"],opts["p_len"],opts["q_len"],-1])) # (b,p,q)
+            ait=tf.nn.softmax(sjt,axis=2)
+            qtm=tf.matmul(ait,h_q) # (b,p,q) batch* (b,q,2h) => (n,p,2h)
+
+            print("qtm: {}".format(qtm))
+
+            # Self Matching Attention
+            print("obtaining self attention...")
+            """adapted from pytorch
+           _s1 = hp.unsqueeze(1) # (b,1,p,2h)
+           _s2 = hp.unsqueeze(2) # (b,p,1,2h)
+           sjt = self.vs(torch.tanh(self.Ws(_s1 * _s2))).squeeze() # (b,p,p,2h)*(2h,h)*(h,) =sq= (b,p,p)
+           ait = F.softmax(sjt, 2) # (b,p,p)
+           qts = ait.bmm(hp) # (b,p,p) b* (b,p,2h) = (b,p,2h)
+           """
+            _s1=tf.expand_dims(h_p,axis=1) # (b,1,p,2h)
+            _s2=tf.expand_dims(h_p,axis=2) # (b,p,1,2h)
+            tanh=self.mat_weight_mul(_s1*_s2,self.W_s) # (b,p*p,h)
+            sjt=self.mat_weight_mul(tanh,tf.reshape(self.V_s,[-1,1])) # (b,p*p,1)
+            sjt=tf.squeeze(tf.reshape(sjt,[opts["batch"],opts["p_len"],opts["p_len"],-1])) # (b,p,p)
+            ait=tf.nn.softmax(sjt,axis=2)
+            qts=tf.matmul(ait,h_p) # (b,p,p) batch* (b,p,2h) => (b,p,2h)
+            print("qts: {}".format(qts))
+
+        with tf.variable_scope("Aggregate_Layer"):
+            print("Layer3: Aggregate Layer")
+            aggregate=tf.concat([h_p, qts, qtc, qtd, qtb, qtm],axis=2) # (b,p,12h)
+            print("aggregate: {}".format(aggregate))
+
+            fw_cells = [self.DropoutWrappedLSTMCell(hidden_size=opts["hidden_size"], in_keep_prob=opts["dropout"]) for _
+                        in range(2)]
+            bw_cells = [self.DropoutWrappedLSTMCell(hidden_size=opts["hidden_size"], in_keep_prob=opts["dropout"]) for _
+                        in range(2)]
+            aggregate_rnn=tf.contrib.rnn.stack_bidirectional_rnn(fw_cells, bw_cells, aggregate, dtype=tf.float32, scope="q_encoding")
+
 
