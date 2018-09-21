@@ -54,6 +54,14 @@ class MwAN:
         self.W_s=self.random_weight(dim_in=2*opts["hidden_size"],dim_out=opts["hidden_size"],name="self_att_w")
         self.V_s = self.random_bias(dim=opts["hidden_size"], name="minus_att_s")
 
+        # prediction layer
+        self.W_q=self.random_weight(dim_in=2*opts["hidden_size"],dim_out=opts["hidden_size"],name="prediction_layer_att_w_q")
+        self.V_q=self.random_bias(dim=opts["hidden_size"],name="prediction_layer_att_v_q")
+        self.W_p1=self.random_weight(dim_in=2*opts["hidden_size"],dim_out=opts["hidden_size"],name="prediction_layer_att_w_p1")
+        self.W_p2=self.random_weight(dim_in=2*opts["hidden_size"],dim_out=opts["hidden_size"],name="prediction_layer_att_w_p2")
+        self.V_p = self.random_bias(dim=opts["hidden_size"], name="prediction_layer_att_v_p")
+        self.W_predict=self.random_weight(dim_in=2*opts["hidden_size"],dim_out=opts["embedding_size"])
+
 
     def build(self):
         print("building model...")
@@ -207,11 +215,28 @@ class MwAN:
             print("Layer3: Aggregate Layer")
             aggregate=tf.concat([h_p, qts, qtc, qtd, qtb, qtm],axis=2) # (b,p,12h)
             print("aggregate: {}".format(aggregate))
+            aggregate_unstack=tf.unstack(aggregate,axis=1) # (p,b,12h)
 
             fw_cells = [self.DropoutWrappedLSTMCell(hidden_size=opts["hidden_size"], in_keep_prob=opts["dropout"]) for _
                         in range(2)]
             bw_cells = [self.DropoutWrappedLSTMCell(hidden_size=opts["hidden_size"], in_keep_prob=opts["dropout"]) for _
                         in range(2)]
-            aggregate_rnn=tf.contrib.rnn.stack_bidirectional_rnn(fw_cells, bw_cells, aggregate, dtype=tf.float32, scope="q_encoding")
+            aggregate_representation,_,_=tf.contrib.rnn.stack_bidirectional_rnn(fw_cells, bw_cells,aggregate_unstack, dtype=tf.float32, scope="aggregate_representation")
+
+            aggregate_representation=tf.stack(aggregate_representation,axis=1) # (b,p,2h) bi-directional
+            print("aggregate_rep: {}".format(aggregate_representation))
+
+        with tf.variable_scope("Prediction_Layer"):
+            print("Layer4: Prediction Layer")
+            # 公式：11a-11c
+            tanh=tf.tanh(self.mat_weight_mul(h_q,self.W_q)) # (b,q,2h)*(2h,h) => (b,q,h)
+            sj=tf.squeeze(self.mat_weight_mul(tanh,tf.reshape(self.V_q,shape=[-1,1]))) # (b,q)
+            ai=tf.nn.softmax(sj,axis=1) # (b,q)
+            ai_tiled=tf.concat([tf.reshape(ai,[opts["batch"],opts["q_len"],1])]*2*opts["hidden_size"],axis=2) # (b,q,2h)
+            ai_tiled=tf.transpose(ai_tiled,perm=[0,2,1]) # FIXME: better to follow the code in pytorch
+            r_q=tf.matmul(h_q,ai_tiled)#
+            print("r_q: {}".format(r_q))
+            # 公式：12a-12c
+            tanh=tf.tanh(self.mat_weight_mul(aggregate_representation,self.W_p1)+self.mat_weight_mul(r_q,self.W_p2))
 
 
